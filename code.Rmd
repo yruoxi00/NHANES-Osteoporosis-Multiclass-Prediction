@@ -1,0 +1,625 @@
+---
+title: "NHANES 2017–2018: Osteoporosis Status Definition and Multiclass Prediction Using Clinical + SDoH Factors"
+author: "Ruoxi Yang"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Packages 
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(cowplot)
+library(scales)
+library(gtsummary)
+library(gt)
+library(forcats)
+library(stringr)
+library(caret)
+library(nnet)
+library(ranger)
+library(fastshap)
+```
+
+# Data 
+
+```{r}
+nhanes_raw <- read_excel("/Users/yrx/Downloads/RY_NHANES_201718/NHANES_201718.xlsx")
+```
+
+# Part A - Cohort and outcome definition (required)
+
+## A1) Analytic cohort
+
+```{r}
+n0 <- nrow(nhanes_raw) # initial n 
+
+nhanes_age50 <- nhanes_raw %>%
+  filter(RIDAGEYR >= 50)
+
+n1 <- nrow(nhanes_age50) # after age n 
+
+nhanes <- nhanes_age50 %>%
+  filter(!is.na(DXXNKBMD))
+
+N <- nrow(nhanes) # final N 
+
+flow_table <- tibble(
+  step = c(
+    "Initial sample (NHANES 2017-2018)",
+    "Excluded: Age < 50",
+    "Remaining after age restriction",
+    "Excluded: Missing femoral neck BMD",
+    "Final analytic cohort (age >= 50 & non-missing BMD)"
+  ),
+  n = c(
+    n0,
+    n0 - n1,
+    n1,
+    n1 - N,
+    N
+  )
+)
+print(flow_table) 
+```
+
+## A2) Compute femoral neck T‑score
+
+The following formula was used to calculate the femoral neck T-score:
+
+$$
+\text{T-score}=
+\frac{\text{BMD}_{\text{participant}} - \text{mean BMD}_{\text{reference}}}
+{\text{SD}_{\text{reference}}}
+$$
+
+where $\text{BMD}_{\text{participant}}$ represents the observed femoral neck bone mineral density (BMD) of the participant, $\text{mean BMD}_{\text{reference}}$ represents the average peak femoral neck BMD of the reference population, and $\text{SD}_{\text{reference}}$ represents the standard deviation of the peak femoral neck BMD in the reference population.
+
+The reference values were derived from the NHANES III young adult reference population adopted by the World Health Organization:
+
+$$
+\begin{aligned}
+\text{mean BMD}_{\text{reference}} &= 0.858\ \text{g/cm}^2 \\
+\text{SD}_{\text{reference}} &= 0.120\ \text{g/cm}^2
+\end{aligned}
+$$
+
+```{r}
+mean_bmd_ref <- 0.858
+sd_bmd_ref   <- 0.120
+
+nhanes <- nhanes %>%
+  mutate(
+    t_score = (DXXNKBMD - mean_bmd_ref) / sd_bmd_ref
+  )
+```
+
+## A3) Define osteoporosis status (multiclass)
+
+```{r}
+nhanes <- nhanes %>%
+  mutate(
+    osteoporosis_status = case_when(
+      t_score >= -1.0 ~ "Normal",
+      t_score < -1.0 & t_score > -2.5 ~ "Osteopenia",
+      t_score <= -2.5 ~ "Osteoporosis",
+      TRUE ~ NA_character_
+    ),
+    osteoporosis_status = factor(
+      osteoporosis_status,
+      levels = c("Normal", "Osteopenia", "Osteoporosis")
+    )
+  )
+
+# overall prevalence 
+prev_all <- nhanes %>%
+  count(osteoporosis_status, name = "n") %>%
+  mutate(
+    total = sum(n),
+    prevalence = n / total
+  )
+print(prev_all)
+
+# by sex 
+prev_sex <- nhanes %>%
+  group_by(gender, osteoporosis_status) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(
+    total = sum(n),
+    prevalence = n / total
+  ) %>%
+  ungroup()
+print(prev_sex)
+
+# by race/ethnicity
+prev_race <- nhanes %>%
+  group_by(race, osteoporosis_status) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(
+    total = sum(n),
+    prevalence = n / total
+  ) %>%
+  ungroup()
+print(prev_race)
+```
+
+# Part B - Descriptive analysis (required)
+
+## B1) Prevalence and plots
+
+```{r}
+nhanes <- nhanes %>%
+  mutate(
+    Gender = factor(gender, levels = c(0, 1), 
+                    labels = c("Male", "Female")),
+    Race = factor(race, levels = c(0, 1, 2, 3, 4), 
+                  labels = c("Hispanic", "White", "Black", "Asian", "Multi-racial")),
+    osteoporosis_status = factor(osteoporosis_status, 
+                                 levels = c("Normal", "Osteopenia", "Osteoporosis"))
+  )
+
+wilson_ci <- function(x, n, z = 1.96) {
+  if (n == 0) return(c(NA_real_, NA_real_))
+  p <- x / n
+  denom <- 1 + z^2 / n
+  center <- (p + z^2 / (2 * n)) / denom
+  half <- z * sqrt((p * (1 - p) + z^2 / (4 * n)) / n) / denom
+  c(center - half, center + half)
+}
+
+prev <- function(dat, group_var = NULL) {
+  if (is.null(group_var)) {
+    dat %>%
+      count(osteoporosis_status, name = "n") %>%
+      mutate(total = sum(n)) %>%
+      rowwise() %>%
+      mutate(
+        p = n / total,
+        lo = wilson_ci(n, total)[1],
+        hi = wilson_ci(n, total)[2]
+      ) %>%
+      ungroup()
+  } else {
+    dat %>%
+      group_by(.data[[group_var]]) %>%
+      count(osteoporosis_status, name = "n") %>%
+      group_by(.data[[group_var]]) %>%
+      mutate(total = sum(n)) %>%
+      rowwise() %>%
+      mutate(
+        p = n / total,
+        lo = wilson_ci(n, total)[1],
+        hi = wilson_ci(n, total)[2]
+      ) %>%
+      ungroup() %>%
+      rename(group = !!group_var)
+  }
+}
+
+tab_all <- prev(nhanes)
+tab_gender <- prev(nhanes, "Gender")
+tab_race <- prev(nhanes, "Race")
+
+BASE_SIZE <- 12
+theme_pub <- theme_classic(base_size = BASE_SIZE) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 11),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0),
+    plot.margin = margin(6, 10, 6, 6),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11)
+  )
+
+pd <- position_dodge(width = 0.78)
+
+p_all <- ggplot(tab_all, aes(x = osteoporosis_status, y = p, fill = osteoporosis_status)) +
+  geom_col(width = 0.72) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), 
+                width = 0.14, linewidth = 0.5, lineend = "round") +
+  geom_text(aes(y = hi + 0.012, label = percent(p, accuracy = 0.1)), 
+            vjust = 0, size = 3.3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, max(tab_all$hi, na.rm = TRUE) * 1.22),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c("Normal" = "#00BA38", 
+                               "Osteopenia" = "#619CFF", 
+                               "Osteoporosis" = "#F8766D")) +
+  labs(x = NULL, y = "Prevalence (%)", title = "Prevalence Overall", fill = NULL) +
+  theme_pub +
+  theme(legend.position = "none")
+
+p_gender <- ggplot(tab_gender, aes(x = group, y = p, fill = osteoporosis_status)) +
+  geom_col(position = pd, width = 0.70) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), position = pd, 
+                width = 0.14, linewidth = 0.5, lineend = "round") +
+  geom_text(aes(y = hi + 0.015, label = percent(p, accuracy = 0.1)), 
+            position = pd, vjust = 0, size = 3.1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, max(tab_gender$hi, na.rm = TRUE) * 1.25),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c("Normal" = "#00BA38", 
+                               "Osteopenia" = "#619CFF", 
+                               "Osteoporosis" = "#F8766D")) +
+  labs(x = NULL, y = "Prevalence (%)", title = "Prevalence By Gender", fill = NULL) +
+  theme_pub
+
+p_race <- ggplot(tab_race, aes(x = group, y = p, fill = osteoporosis_status)) +
+  geom_col(position = pd, width = 0.70) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), position = pd, 
+                width = 0.14, linewidth = 0.5, lineend = "round") +
+  geom_text(aes(y = hi + 0.018, label = percent(p, accuracy = 0.1)), 
+            position = pd, vjust = 0, size = 2.9) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, max(tab_race$hi, na.rm = TRUE) * 1.28),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c("Normal" = "#00BA38", 
+                               "Osteopenia" = "#619CFF", 
+                               "Osteoporosis" = "#F8766D")) +
+  labs(x = NULL, y = "Prevalence (%)", title = "Prevalence By Race/Ethnicity", fill = NULL) +
+  theme_pub +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+legend_shared <- get_legend(p_gender)
+
+p_gender_noleg <- p_gender + theme(legend.position = "none")
+p_race_noleg <- p_race + theme(legend.position = "none")
+
+row_panels <- plot_grid(
+  p_all, p_gender_noleg, p_race_noleg,
+  labels = c("a", "b", "c"),
+  label_size = 16,
+  ncol = 3,
+  align = "hv"
+)
+
+p <- plot_grid(
+  row_panels,
+  legend_shared,
+  ncol = 1,
+  rel_heights = c(1, 0.1)
+)
+# print(p)
+
+# ggsave("/Users/yrx/Downloads/RY_NHANES_201718/Fig_B1_Prevalence.pdf", p, width = 14, height = 5.5)
+
+```
+## B2) Table 1
+
+```{r}
+nhanes_tbl1 <- nhanes %>%
+  mutate(
+    Gender = factor(gender, levels = c(0,1), labels = c("Male","Female")),
+    Race = factor(race, levels = c(0,1,2,3,4),
+                  labels = c("Hispanic","White","Black","Asian","Multi-racial")),
+    Education = factor(edu,
+      levels = c(1,2,3,4,0),
+      labels = c("Less than HS","High school","Some college/AA",
+                 "College graduate","Advanced degree")),
+    PhysicalActivity = factor(phyac, levels = c(0,1), labels = c("Inactive","Active")),
+    Alcohol = factor(alcol, levels = c(0,1), labels = c("No","Yes")),
+    Smoking = factor(smkstat, levels = c(0,1,2),
+                     labels = c("Never","Former","Current")),
+    Menopause = factor(meno, levels = c(0,1),
+                       labels = c("Pre/Peri-menopausal","Post-menopausal")),
+    FractureHx = factor(fx, levels = c(0,1), labels = c("No","Yes")),
+    RheumatoidArthritis = factor(rheu, levels = c(0,1), labels = c("No","Yes")),
+    ThyroidDisease = factor(thyroid, levels = c(0,1), labels = c("No","Yes")),
+    HRT = factor(hrt, levels = c(0,1), labels = c("No","Yes")),
+    Pregnancy = factor(pregnan, levels = c(0,1), labels = c("No","Yes"))
+  )
+
+table1 <- nhanes_tbl1 %>%
+  select(
+    osteoporosis_status,
+    RIDAGEYR,
+    Gender, Race,
+    Education, INDFMPIR,
+    PhysicalActivity, Alcohol, Smoking,
+    Menopause, FractureHx, RheumatoidArthritis, ThyroidDisease,
+    BMXWT, BMXHT, BMXBMI, BMXWAIST,
+    DXXOFBMD, DXXNKBMD, DXXTRBMD, DXXINBMD,
+    calcium, vitamin,
+    HRT, Pregnancy
+  ) %>%
+  tbl_summary(
+    by = osteoporosis_status,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    missing = "no"
+  ) %>%
+  add_p(
+    test = list(
+      all_continuous() ~ "kruskal.test",
+      all_categorical() ~ "chisq.test"
+    )
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  bold_labels()
+# print(table1)
+
+# table1 %>% as_gt() %>% gtsave("/Users/yrx/Downloads/RY_NHANES_201718/Table1.pdf")
+
+```
+
+# Part C - Multiclass modeling (required)
+
+```{r}
+set.seed(123)
+
+pal <- c("Normal" = "#00BA38", "Osteopenia" = "#619CFF", "Osteoporosis" = "#F8766D")
+
+dat0 <- nhanes %>%
+  mutate(
+    Gender = factor(gender, levels = c(0, 1), labels = c("Male", "Female")),
+    Race = factor(race, levels = c(0, 1, 2, 3, 4), 
+                  labels = c("Hispanic", "White", "Black", "Asian", "Multi-racial")),
+    Education = factor(edu, levels = c(0, 1, 2, 3, 4),
+                       labels = c("Advanced degree", "Less than HS", 
+                                  "High school", "Some college/AA", "College graduate+")),
+    PhysicalActivity = factor(phyac, levels = c(0, 1), labels = c("Inactive", "Active")),
+    Alcohol = factor(alcol, levels = c(0, 1), labels = c("No", "Yes")),
+    Smoking = factor(smkstat, levels = c(0, 1, 2), labels = c("Never", "Former", "Current")),
+    Menopause = factor(meno, levels = c(0, 1), labels = c("Pre/Peri", "Post")),
+    FractureHx = factor(fx, levels = c(0, 1), labels = c("No", "Yes")),
+    RheumatoidArthritis = factor(rheu, levels = c(0, 1), labels = c("No", "Yes")),
+    ThyroidDisease = factor(thyroid, levels = c(0, 1), labels = c("No", "Yes")),
+    HRT = factor(hrt, levels = c(0, 1), labels = c("No", "Yes")),
+    Pregnancy = factor(pregnan, levels = c(0, 1), labels = c("No", "Yes")),
+    y = factor(osteoporosis_status, levels = c("Normal", "Osteopenia", "Osteoporosis"))
+  )
+
+predictors_full <- c(
+  "RIDAGEYR", "Gender", "Race",
+  "BMXWT", "BMXHT", "BMXBMI", "BMXWAIST",
+  "PhysicalActivity", "Alcohol", "Smoking",
+  "Menopause", "FractureHx", "RheumatoidArthritis", "ThyroidDisease",
+  "HRT", "Pregnancy",
+  "Education", "INDFMPIR"
+)
+
+predictors_nosdoh <- setdiff(predictors_full, c("Education", "INDFMPIR"))
+
+keep_cols_full <- c("y", predictors_full)
+keep_cols_nosdoh <- c("y", predictors_nosdoh)
+
+dat_full <- dat0 %>%
+  select(all_of(keep_cols_full)) %>%
+  drop_na()
+
+dat_nosdoh <- dat0 %>%
+  select(all_of(keep_cols_nosdoh)) %>%
+  drop_na()
+
+make_cv_folds <- function(y, k = 5, seed = 123) {
+  set.seed(seed)
+  createFolds(y, k = k, returnTrain = FALSE)
+}
+
+macro_f1 <- function(cm) {
+  diagv <- diag(cm)
+  prec <- diagv / pmax(colSums(cm), 1)
+  rec <- diagv / pmax(rowSums(cm), 1)
+  f1 <- 2 * prec * rec / pmax(prec + rec, 1e-12)
+  mean(f1, na.rm = TRUE)
+}
+
+balanced_acc <- function(cm) {
+  rec <- diag(cm) / pmax(rowSums(cm), 1)
+  mean(rec, na.rm = TRUE)
+}
+
+eval_from_preds <- function(y_true, y_pred, levs) {
+  y_true <- factor(y_true, levels = levs)
+  y_pred <- factor(y_pred, levels = levs)
+  cm <- table(y_true, y_pred)
+  list(
+    cm = cm,
+    acc = sum(diag(cm)) / sum(cm),
+    macro_f1 = macro_f1(cm),
+    bal_acc = balanced_acc(cm)
+  )
+}
+
+cv_multinom <- function(dat, k = 5, seed = 123, maxit = 100) {
+  levs <- levels(dat$y)
+  folds <- make_cv_folds(dat$y, k = k, seed = seed)
+  preds <- rep(NA_character_, nrow(dat))
+  probs <- matrix(NA_real_, nrow(dat), length(levs))
+  colnames(probs) <- levs
+  for (i in seq_along(folds)) {
+    te <- folds[[i]]
+    tr <- setdiff(seq_len(nrow(dat)), te)
+    fit <- multinom(y ~ ., data = dat[tr, ], trace = FALSE, maxit = maxit)
+    pprob <- predict(fit, newdata = dat[te, ], type = "probs")
+    if (is.vector(pprob)) {
+      tmp <- matrix(NA_real_, nrow = length(te), ncol = length(levs))
+      colnames(tmp) <- levs
+      cls <- colnames(pprob)
+      tmp[, cls] <- pprob
+      pprob <- tmp
+    } else {
+      pprob <- as.matrix(pprob)
+      pprob <- pprob[, levs, drop = FALSE]
+    }
+    preds[te] <- levs[max.col(pprob, ties.method = "first")]
+    probs[te, ] <- pprob
+  }
+  out <- eval_from_preds(dat$y, preds, levs)
+  out$pred <- factor(preds, levels = levs)
+  out$prob <- probs
+  out
+}
+
+cv_rf <- function(dat, k = 5, seed = 123, num.trees = 500, mtry = NULL, min.node.size = 5) {
+  levs <- levels(dat$y)
+  folds <- make_cv_folds(dat$y, k = k, seed = seed)
+  preds <- rep(NA_character_, nrow(dat))
+  probs <- matrix(NA_real_, nrow(dat), length(levs))
+  colnames(probs) <- levs
+  for (i in seq_along(folds)) {
+    te <- folds[[i]]
+    tr <- setdiff(seq_len(nrow(dat)), te)
+    fit <- ranger(
+      y ~ .,
+      data = dat[tr, ],
+      probability = TRUE,
+      num.trees = num.trees,
+      mtry = mtry,
+      min.node.size = min.node.size,
+      seed = seed + i
+    )
+    pprob <- predict(fit, dat[te, ])$predictions
+    pprob <- pprob[, levs, drop = FALSE]
+    preds[te] <- levs[max.col(pprob, ties.method = "first")]
+    probs[te, ] <- pprob
+  }
+  out <- eval_from_preds(dat$y, preds, levs)
+  out$pred <- factor(preds, levels = levs)
+  out$prob <- probs
+  out
+}
+
+res_multinom_full <- cv_multinom(dat_full, k = 5, seed = 123)
+res_multinom_nosdoh <- cv_multinom(dat_nosdoh, k = 5, seed = 123)
+
+res_rf_full <- cv_rf(dat_full, k = 5, seed = 123, num.trees = 500, min.node.size = 5)
+res_rf_nosdoh <- cv_rf(dat_nosdoh, k = 5, seed = 123, num.trees = 500, min.node.size = 5)
+
+perf <- tibble(
+  model = c("Multinomial LR (Full)", "Multinomial LR (No SDoH)", 
+            "RF (Full)", "RF (No SDoH)"),
+  accuracy = c(res_multinom_full$acc, res_multinom_nosdoh$acc, 
+               res_rf_full$acc, res_rf_nosdoh$acc),
+  macro_f1 = c(res_multinom_full$macro_f1, res_multinom_nosdoh$macro_f1, 
+               res_rf_full$macro_f1, res_rf_nosdoh$macro_f1),
+  balanced_accuracy = c(res_multinom_full$bal_acc, res_multinom_nosdoh$bal_acc, 
+                        res_rf_full$bal_acc, res_rf_nosdoh$bal_acc)
+)
+print(perf)
+
+cat("\nMultinomial LR (Full) confusion matrix:\n")
+print(res_multinom_full$cm)
+
+cat("\nMultinomial LR (No SDoH) confusion matrix:\n")
+print(res_multinom_nosdoh$cm)
+
+cat("\nRandom Forest (Full) confusion matrix:\n")
+print(res_rf_full$cm)
+
+cat("\nRandom Forest (No SDoH) confusion matrix:\n")
+print(res_rf_nosdoh$cm)
+
+fit_rf_final <- ranger(
+  y ~ .,
+  data = dat_full,
+  probability = TRUE,
+  num.trees = 500,
+  min.node.size = 5,
+  seed = 123
+)
+
+X_full <- dat_full %>% select(-y)
+y_full <- dat_full$y
+levs <- levels(y_full)
+
+set.seed(123)
+idx_shap <- sample(seq_len(nrow(X_full)), size = min(400, nrow(X_full)))
+X_shap <- X_full[idx_shap, , drop = FALSE]
+
+pred_fun_class <- function(cls) {
+  function(object, newdata) {
+    p <- predict(object, data = newdata)$predictions
+    as.numeric(p[, cls])
+  }
+}
+
+set.seed(123)
+sh_list <- lapply(levs, function(cls) {
+  explain(
+    object = fit_rf_final,
+    X = X_shap,
+    pred_wrapper = pred_fun_class(cls),
+    nsim = 10,
+    adjust = TRUE
+  )
+})
+names(sh_list) <- levs
+
+sh_abs_by_class <- lapply(sh_list, function(m) colMeans(abs(m), na.rm = TRUE))
+sh_abs_mat <- do.call(cbind, sh_abs_by_class)
+sh_mean <- rowMeans(sh_abs_mat)
+
+sh_tbl <- tibble(
+  feature = names(sh_mean),
+  value = as.numeric(sh_mean)
+) %>%
+  arrange(desc(value))
+
+p_shap <- ggplot(sh_tbl, aes(x = reorder(feature, value), y = value)) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "SHAP",
+    title = "Random Forest SHAP: Feature Importance (All Predictors)"
+  ) +
+  theme_classic(base_size = 12)
+
+# print(p_shap)
+
+# ggsave("/Users/yrx/Downloads/RY_NHANES_201718/Fig_C_SHAP.pdf", p_shap, width = 10, height = 5.5)
+
+```
+
+# Part D - Missing data and reproducibility (required)
+
+```{r}
+vars_model <- c(
+  "RIDAGEYR", "Gender", "Race",
+  "BMXWT", "BMXHT", "BMXBMI", "BMXWAIST",
+  "PhysicalActivity", "Alcohol", "Smoking",
+  "Menopause", "FractureHx", "RheumatoidArthritis", "ThyroidDisease",
+  "HRT", "Pregnancy",
+  "Education", "INDFMPIR"
+)
+
+missing_summary <- dat0 %>%
+  select(all_of(vars_model)) %>%
+  summarise(across(
+    everything(),
+    ~ sum(is.na(.)),
+    .names = "n_missing_{.col}"
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "n_missing"
+  ) %>%
+  mutate(
+    variable = sub("^n_missing_", "", variable),
+    pct_missing = n_missing / nrow(dat0) * 100
+  ) %>%
+  arrange(desc(pct_missing))
+
+print(missing_summary)
+
+N_full <- nrow(dat_full)
+N_nosdoh <- nrow(dat_nosdoh)
+
+print(N_full)
+print(N_nosdoh)
+
+```
